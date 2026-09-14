@@ -42,6 +42,8 @@ static void error(const char* message) {
   exit(EXIT_FAILURE);
 }
 
+// Returns a shifted enum value of the keyword or -1.
+
 static int compKeywords(char* str, size_t len) {
   static const char* const keywords[] = {
     "var", "if", "then", "elsif", "else", "end", "while", "loop",
@@ -71,7 +73,7 @@ static void parseLetter(FILE* inf, FILE* outf, int c){
   buf[0] = (char)c;
 
   while((c = getc(inf)) != EOF){
-    if (!isalpha(c) && !isdigit(c) && c != '_') {
+    if (!isalpha(c) && !isdigit(c) && c != '_') { // Next token
       ungetc(c, inf);
       break;
     }
@@ -83,10 +85,9 @@ static void parseLetter(FILE* inf, FILE* outf, int c){
   kw = compKeywords(buf, len);
 
   if (kw >= 0) {
-    fprintf(outf, "K%c\n", kw);
-  }
-  else {
-    fputc('E', outf);
+    fprintf(outf, "K%c\n", kw); // Keyword
+  } else {
+    fputc('E', outf); // Identifier
 
     {
       int i;
@@ -120,7 +121,7 @@ static void parseDigit(FILE* inf, FILE* outf, int c){
       if (is_real || is_exp) {
         error("Incorrect real syntax");
       } else {
-        // Check for range op
+        // Check for range op (..)
         int tempc = getc(inf);
 
         if (tempc == '.') {
@@ -156,16 +157,16 @@ static void parseDigit(FILE* inf, FILE* outf, int c){
         }
       }
 
-    } else { // New operator
+    } else { // Next token
       ungetc(c, inf);
       break;
     }
   }
 
   if (is_real) {
-    fputc('R', outf); // todo: replace with enum
+    fputc('R', outf); // Real
   } else {
-    fputc('I', outf); // todo: replace with enum
+    fputc('I', outf); // Integer
   }
 
   {
@@ -183,9 +184,11 @@ static void parseOther(FILE* inf, FILE* outf, int c){
     case ';':
       print_opr(O_SEMICOL); // ;
     break;
+
     case ',':
       print_opr(O_COMMA); // ,
     break;
+
     case ':':
       c = getc(inf);
       if (c != '=') {
@@ -193,6 +196,7 @@ static void parseOther(FILE* inf, FILE* outf, int c){
       }
       print_opr(O_ASSIGN); // :=
     break;
+
     case '=':
       c = getc(inf);
       if (c == '>') {
@@ -202,6 +206,7 @@ static void parseOther(FILE* inf, FILE* outf, int c){
         ungetc(c, inf);
       }
     break;
+
     case '.':
       c = getc(inf);
       if (c == '.'){
@@ -213,12 +218,15 @@ static void parseOther(FILE* inf, FILE* outf, int c){
         ungetc(c, inf);
       }
     break;
+
     case '[':
       print_opr(O_SBOPEN); // [
     break;
+
     case ']':
       print_opr(O_SBCLOSE); // ]
     break;
+
     case '<':
       c = getc(inf);
       if(c == '='){
@@ -228,6 +236,7 @@ static void parseOther(FILE* inf, FILE* outf, int c){
          ungetc(c, inf);
       }
     break;
+
     case '>':
       c = getc(inf);
       if(c == '='){
@@ -237,11 +246,12 @@ static void parseOther(FILE* inf, FILE* outf, int c){
         ungetc(c, inf);
       }
     break;
+
     case '/':
       c = getc(inf);
       if (c == '=') {
         print_opr(O_NEQ); // /=
-      } else if (c == '/') {
+      } else if (c == '/') { // Comments (single-line)
         while (1) {
           c = getc(inf);
           if (c == '\r' || c == '\n' || c == EOF) break;
@@ -252,33 +262,43 @@ static void parseOther(FILE* inf, FILE* outf, int c){
         ungetc(c, inf);
       }
     break;
+
     case '+':
       print_opr(O_ADD); // +
     break;
+
     case '-':
       print_opr(O_SUB); // -
     break;
+
     case '*':
       print_opr(O_MUL); // *
     break;
+
     case '(':
       print_opr(O_BOPEN); // (
     break;
+
     case ')':
       print_opr(O_BCLOSE); // )
     break;
+
     case '{':
       print_opr(O_CBOPEN); // {
     break;
+
     case '}':
       print_opr(O_CBCLOSE); // }
     break;
+
     case '%':
       print_opr(O_REM); // %
     break;
+
     case '$':
       print_opr(O_LEN); // $
     break;
+
     case '?':
       c = getc(inf);
       if (c != '[') {
@@ -286,6 +306,7 @@ static void parseOther(FILE* inf, FILE* outf, int c){
       }
       print_opr(O_EXISTS); // ?[
     break;
+
     // Strings
     case '\'': /* SingleQuoteString */
       fputc('S', outf);
@@ -296,6 +317,7 @@ static void parseOther(FILE* inf, FILE* outf, int c){
 
       fputs("'\n", outf);
     break;
+
     case '\"': /* DoubleQuoteString */
       fputc('D', outf);
       while ((c = getc(inf)) != '"') {
@@ -305,6 +327,7 @@ static void parseOther(FILE* inf, FILE* outf, int c){
 
       fputs("\"\n", outf);
     break;
+
     // Line break
     case '\n':
     case '\r':
@@ -314,9 +337,11 @@ static void parseOther(FILE* inf, FILE* outf, int c){
       }
       ungetc(c, inf);
     break;
+
     // Whitespace
     case ' ':
     break;
+
     // If encountered an unexpected symbol that is not a part of a string, throw an error.
     default:
       error("Unexpected symbol");
@@ -333,6 +358,7 @@ int main(void) {
     error("Cannot open file prog.d");
     return EXIT_FAILURE;
   }
+
   if (outf == NULL) {
     error("Cannot open file tokens");
     return EXIT_FAILURE;
