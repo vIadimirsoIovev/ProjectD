@@ -56,10 +56,8 @@ static int compKeywords(char* str, size_t len) {
   size_t i;
 
   for (i = 0; i < klen; i++) {
-    size_t maxlen = strlen(keywords[i]);
-    if (len > maxlen) maxlen = len;
-
-    if (memcmp(str, keywords[i], maxlen) == 0) return i + 32;
+    if (strlen(keywords[i]) == len && memcmp(str, keywords[i], len) == 0)
+      return i + 32;
   }
 
   return -1;
@@ -102,6 +100,7 @@ static void parseLetter(FILE* inf, FILE* outf, int c){
 static void parseDigit(FILE* inf, FILE* outf, int c){
   int is_real = 0;
   int is_exp = 0;
+  int is_range = 0;
   int len = 1;
   char buf[32];
 
@@ -125,7 +124,8 @@ static void parseDigit(FILE* inf, FILE* outf, int c){
         int tempc = getc(inf);
 
         if (tempc == '.') {
-          print_opr(O_RANGE);
+          // The number must be emitted first, the range op after it.
+          is_range = 1;
           break;
         }
 
@@ -145,11 +145,17 @@ static void parseDigit(FILE* inf, FILE* outf, int c){
       } else {
         is_real = 1;
         is_exp = 1;
+        if (len == 32) error("Too long real number");
         buf[len++] = (char)c;
 
         c = getc(inf);
         if(c == '+' || c == '-') { // 1e+1 or 1e-1
+          if (len == 32) error("Too long real number");
           buf[len++] = (char)c;
+
+          c = getc(inf);
+          if (!isdigit(c)) error("Incorrect real syntax");
+          ungetc(c, inf);
         } else if (isdigit(c)) { // 1e1
           ungetc(c, inf);
         } else {
@@ -175,6 +181,10 @@ static void parseDigit(FILE* inf, FILE* outf, int c){
       fputc(buf[i], outf);
     }
     fputc('\n', outf);
+  }
+
+  if (is_range) {
+    print_opr(O_RANGE); // ..
   }
 }
 
@@ -340,6 +350,7 @@ static void parseOther(FILE* inf, FILE* outf, int c){
 
     // Whitespace
     case ' ':
+    case '\t':
     break;
 
     // If encountered an unexpected symbol that is not a part of a string, throw an error.

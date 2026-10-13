@@ -125,6 +125,7 @@ static const char* token_desc(struct token* t) {
 }
 
 static struct token* peek(void);
+static struct token* peek_n(int n);
 
 static void parse_error(const char* expected) {
   fprintf(stderr, "parse error at line %d: expected %s, got %s\n",
@@ -134,8 +135,23 @@ static void parse_error(const char* expected) {
 
 static struct token* peek(void) {
   static struct token eof_tok; /* zeroed, type 0 means the end of input */
+  /* newlines are only kept for line-number reporting: skip them here */
+  while (cur_tok < tok_cnt && tokens[cur_tok].type == 'N') cur_tok++;
   if (cur_tok >= tok_cnt) return &eof_tok;
   return &tokens[cur_tok];
+}
+
+/* the n-th next significant token (0 = same as peek), newlines skipped */
+static struct token* peek_n(int n) {
+  static struct token eof_tok;
+  int i = cur_tok;
+  while (i < tok_cnt && tokens[i].type == 'N') i++;
+  while (n-- > 0 && i < tok_cnt) {
+    i++;
+    while (i < tok_cnt && tokens[i].type == 'N') i++;
+  }
+  if (i >= tok_cnt) return &eof_tok;
+  return &tokens[i];
 }
 
 static struct token* read_token(void) {
@@ -283,7 +299,18 @@ static struct ast_node* parse_rvalue(void) {
       } else {
         parse_error("identifier or integer after \".\"");
       }
-    } else if (at_op(O_LEN)) { /* rvalue "[$]" */
+    } else if (at_op(O_SBOPEN)) { /* rvalue "[expr]" or rvalue "[$]" */
+      read_token();
+      if (at_op(O_LEN)) {
+        read_token();
+        expect_op(O_SBCLOSE);
+        ref = ast_node(AN_ARRLEN, 1, ref);
+      } else {
+        struct ast_node* idx = parse_expr();
+        expect_op(O_SBCLOSE);
+        ref = ast_node(AN_ARRELEM, 2, ref, idx);
+      }
+    } else if (at_op(O_LEN)) { /* rvalue "[$]" (kept for compatibility) */
       read_token();
       if (at_op(O_SBCLOSE)) read_token();
       ref = ast_node(AN_ARRLEN, 1, ref);
@@ -413,12 +440,499 @@ static struct ast_node* parse_tpllit(void) {
 
 /* tplelem := [IDENT ":="] expr */
 static struct ast_node* parse_tplelem(void) {
-  if (at_ident() && cur_tok + 1 < tok_cnt &&
-      tokens[cur_tok + 1].type == 'O' && tokens[cur_tok + 1].tv.op == O_ASSIGN) {
+  if (at_ident() && peek_n(1)->type == 'O' && peek_n(1)->tv.op == O_ASSIGN) {
     struct ast_node* id = ident_node(expect_ident());
     read_token(); /* := */
     return ast_node(AN_TPLELEM, 2, id, parse_expr());
   }
 
   return ast_node(AN_TPLELEM, 1, parse_expr());
+}
+
+/* ======================================================================== */
+/* ---- remaining part: types, expressions, statements, body, driver ---- */
+/* ======================================================================== */
+
+static struct ast_node* parse_typeident(void);
+static struct ast_node* parse_primary(void);
+static struct ast_node* parse_unary(void);
+static struct ast_node* parse_term(void);
+static struct ast_node* parse_factor(void);
+static struct ast_node* parse_rel(void);
+static struct ast_node* parse_decl(void);
+static struct ast_node* parse_if(void);
+static struct ast_node* parse_while(void);
+static struct ast_node* parse_for(void);
+static struct ast_node* parse_loop(void);
+static struct ast_node* parse_return(void);
+static struct ast_node* parse_print(void);
+static struct ast_node* parse_statement(void);
+
+static void ast_dump(struct ast_node* n, int depth);
+static void load_tokens(const char* path);
+static char* read_until(FILE* f, int term);
+
+static char* dup_str(const char* s) {
+  size_t len = strlen(s);
+  char* p = malloc(len + 1);
+  if (p == NULL) error("Out of memory");
+  memcpy(p, s, len + 1);
+  return p;
+}
+
+/* ---- types -------------------------------------------------------------- */
+
+/* typeident := "int" | "real" | "bool" | "string" | "none" | "func"
+              | "[" typeident "]" | "{" [typeident {"," typeident}] "}" */
+static struct ast_node* parse_typeident(void) {
+  if (at_kw(K_INT))    { read_token(); return ast_node(AN_INT, 0); }
+  if (at_kw(K_REAL))   { read_token(); return ast_node(AN_REAL, 0); }
+  if (at_kw(K_BOOL))   { read_token(); return ast_node(AN_BOOL, 0); }
+  if (at_kw(K_STRING)) { read_token(); return ast_node(AN_STRING, 0); }
+  if (at_kw(K_NONE))   { read_token(); return ast_node(AN_NONE, 0); }
+  if (at_kw(K_FUNC))   { read_token(); return ast_node(AN_FUNC, 0); }
+
+  if (at_op(O_SBOPEN)) { /* array type */
+    struct ast_node* elem;
+    read_token();
+    elem = parse_typeident();
+    expect_op(O_SBCLOSE);
+    return ast_node(AN_ARRTYPE, 1, elem);
+  }
+
+  if (at_op(O_CBOPEN)) { /* tuple type */
+    struct ast_node* n = ast_node(AN_TPLTYPE, 0);
+    read_token();
+    if (!at_op(O_CBCLOSE)) {
+      for (;;) {
+        ast_add(n, parse_typeident());
+        if (!at_op(O_COMMA)) break;
+        read_token();
+      }
+    }
+    expect_op(O_CBCLOSE);
+    return n;
+  }
+
+  parse_error("type identifier");
+  return NULL;
+}
+
+/* ---- expressions -------------------------------------------------------- */
+
+static int starts_literal(void) {
+  struct token* t = peek();
+  if (t->type == 'I' || t->type == 'R' || t->type == 'S' || t->type == 'D')
+    return 1;
+  if (t->type == 'K' &&
+      (t->tv.key == K_TRUE || t->tv.key == K_FALSE || t->tv.key == K_NONE))
+    return 1;
+  if (t->type == 'O' && (t->tv.op == O_SBOPEN || t->tv.op == O_CBOPEN))
+    return 1;
+  return 0;
+}
+
+/* primary := literal | funcliteral | "(" expr ")"
+              | rvalue ["is" typeident] */
+static struct ast_node* parse_primary(void) {
+  struct token* t = peek();
+
+  if (t->type == 'K' && t->tv.key == K_FUNC)
+    return parse_funcliteral();
+
+  if (at_op(O_BOPEN)) {
+    struct ast_node* e;
+    read_token();
+    e = parse_expr();
+    expect_op(O_BCLOSE);
+    return ast_node(AN_PARENTHESES, 1, e);
+  }
+
+  if (starts_literal())
+    return parse_literal();
+
+  {
+    struct ast_node* r = parse_rvalue();
+    if (at_kw(K_IS)) {
+      read_token();
+      return ast_node(AN_ISEXPR, 2, r, parse_typeident());
+    }
+    return r;
+  }
+}
+
+/* unary := ("+"|"-"|"not") unary | primary */
+static struct ast_node* parse_unary(void) {
+  if (at_op(O_ADD)) { read_token(); return ast_node(AN_UNARYPLUS,  1, parse_unary()); }
+  if (at_op(O_SUB)) { read_token(); return ast_node(AN_UNARYMINUS, 1, parse_unary()); }
+  if (at_kw(K_NOT)) { read_token(); return ast_node(AN_NOT,        1, parse_unary()); }
+  return parse_primary();
+}
+
+/* term := unary {("*"|"/"|"%") unary} */
+static struct ast_node* parse_term(void) {
+  struct ast_node* first = parse_unary();
+  struct ast_node* n;
+  char ops[64];
+  int cnt = 0;
+
+  if (!at_op(O_MUL) && !at_op(O_DIV) && !at_op(O_REM)) return first;
+
+  n = ast_node(AN_TERM, 0);
+  ast_add(n, first);
+  while (at_op(O_MUL) || at_op(O_DIV) || at_op(O_REM)) {
+    if (at_op(O_MUL))      ops[cnt++] = '*';
+    else if (at_op(O_DIV)) ops[cnt++] = '/';
+    else                   ops[cnt++] = '%';
+    read_token();
+    ast_add(n, parse_unary());
+  }
+  ops[cnt] = '\0';
+  n->node_type = dup_str(ops);
+  return n;
+}
+
+/* factor := term {("+"|"-") term} */
+static struct ast_node* parse_factor(void) {
+  struct ast_node* first = parse_term();
+  struct ast_node* n;
+  char ops[64];
+  int cnt = 0;
+
+  if (!at_op(O_ADD) && !at_op(O_SUB)) return first;
+
+  n = ast_node(AN_FACTOR, 0);
+  ast_add(n, first);
+  while (at_op(O_ADD) || at_op(O_SUB)) {
+    ops[cnt++] = at_op(O_ADD) ? '+' : '-';
+    read_token();
+    ast_add(n, parse_term());
+  }
+  ops[cnt] = '\0';
+  n->node_type = dup_str(ops);
+  return n;
+}
+
+/* rel := factor [ ("<"|">"|"<="|">="|"="|"/=") factor ] */
+static struct ast_node* parse_rel(void) {
+  struct ast_node* l = parse_factor();
+  struct token* t = peek();
+  enum an_type ty;
+
+  if (t->type != 'O') return l;
+  switch (t->tv.op) {
+    case O_LE:  ty = AN_COMP_LE; break;
+    case O_LT:  ty = AN_COMP_LT; break;
+    case O_EQ:  ty = AN_COMP_EQ; break;
+    case O_NEQ: ty = AN_COMP_NE; break;
+    case O_GE:  ty = AN_COMP_GE; break;
+    case O_GT:  ty = AN_COMP_GT; break;
+    default: return l;
+  }
+  read_token();
+  return ast_node(ty, 2, l, parse_factor());
+}
+
+/* expr := rel {("and"|"or"|"xor") rel} */
+struct ast_node* parse_expr(void) {
+  struct ast_node* first = parse_rel();
+  struct ast_node* n;
+  char ops[64];
+  int cnt = 0;
+
+  if (!at_kw(K_AND) && !at_kw(K_OR) && !at_kw(K_XOR)) return first;
+
+  n = ast_node(AN_EXPR, 0);
+  ast_add(n, first);
+  while (at_kw(K_AND) || at_kw(K_OR) || at_kw(K_XOR)) {
+    if (at_kw(K_AND))      ops[cnt++] = 'a';
+    else if (at_kw(K_OR))  ops[cnt++] = 'o';
+    else                   ops[cnt++] = 'x';
+    read_token();
+    ast_add(n, parse_rel());
+  }
+  ops[cnt] = '\0';
+  n->node_type = dup_str(ops);
+  return n;
+}
+
+/* ---- statements --------------------------------------------------------- */
+
+/* returns 1 when the next token cannot start a statement */
+static int at_stmt_end(void) {
+  struct token* t = peek();
+  if (t->type == 0) return 1;
+  if (t->type == 'O' && t->tv.op == O_SEMICOL) return 1;
+  if (t->type == 'K' &&
+      (t->tv.key == K_END || t->tv.key == K_ELSE || t->tv.key == K_ELSIF))
+    return 1;
+  return 0;
+}
+
+/* decl := "var" vardef {"," vardef} */
+static struct ast_node* parse_decl(void) {
+  struct ast_node* n = ast_node(AN_DECL, 0);
+
+  expect_kw(K_VAR);
+  for (;;) {
+    struct ast_node* vd;
+    char* name = expect_ident();
+    if (at_op(O_ASSIGN)) {
+      read_token();
+      vd = ast_node(AN_VARDEF, 2, ident_node(name), parse_expr());
+    } else {
+      vd = ast_node(AN_VARDEF, 1, ident_node(name));
+    }
+    ast_add(n, vd);
+    if (!at_op(O_COMMA)) break;
+    read_token();
+  }
+  return n;
+}
+
+/* if := "if" expr "then" body {"elsif" expr "then" body}
+        ["else" body] "end" | "if" expr "=>" expr */
+static struct ast_node* parse_if(void) {
+  struct ast_node *cond, *body, *n;
+
+  expect_kw(K_IF);
+  cond = parse_expr();
+
+  if (at_op(O_ARROW)) { /* short form: if expr => statement */
+    read_token();
+    return ast_node(AN_IFSHORT, 2, cond, parse_statement());
+  }
+
+  expect_kw(K_THEN);
+  body = parse_body();
+  n = ast_node(AN_IF, 2, cond, body);
+
+  while (at_kw(K_ELSIF)) {
+    read_token();
+    cond = parse_expr();
+    expect_kw(K_THEN);
+    ast_add(n, cond);
+    ast_add(n, parse_body());
+  }
+  if (at_kw(K_ELSE)) {
+    read_token();
+    ast_add(n, parse_body());
+  }
+  expect_kw(K_END);
+  return n;
+}
+
+/* while := "while" expr "loop" body "end" */
+static struct ast_node* parse_while(void) {
+  struct ast_node *cond, *body;
+
+  expect_kw(K_WHILE);
+  cond = parse_expr();
+  expect_kw(K_LOOP);
+  body = parse_body();
+  expect_kw(K_END);
+  return ast_node(AN_WHILE, 2, cond, body);
+}
+
+/* for := "for" ["ident" "in"] expr [".." expr] "loop" body "end" */
+static struct ast_node* parse_for(void) {
+  int has_var;
+  char* vname = NULL;
+  struct ast_node *from, *to = NULL, *body;
+
+  expect_kw(K_FOR);
+
+  has_var = at_ident() &&
+            peek_n(1)->type == 'K' && peek_n(1)->tv.key == K_IN;
+  if (has_var) {
+    vname = expect_ident();
+    expect_kw(K_IN);
+  }
+
+  from = parse_expr();
+
+  if (at_op(O_RANGE)) {
+    read_token();
+    to = parse_expr();
+  }
+
+  expect_kw(K_LOOP);
+  body = parse_body();
+  expect_kw(K_END);
+
+  if (has_var && to != NULL)
+    return ast_node(AN_FORVD, 4, ident_node(vname), from, to, body);
+  if (has_var)
+    return ast_node(AN_FORVND, 3, ident_node(vname), from, body);
+  if (to != NULL)
+    return ast_node(AN_FORNVD, 3, from, to, body);
+  return ast_node(AN_FORNVND, 2, from, body);
+}
+
+/* loop := "loop" body "end" */
+static struct ast_node* parse_loop(void) {
+  struct ast_node* body;
+  expect_kw(K_LOOP);
+  body = parse_body();
+  expect_kw(K_END);
+  return ast_node(AN_LOOP, 1, body);
+}
+
+/* return := "return" [expr] */
+static struct ast_node* parse_return(void) {
+  expect_kw(K_RETURN);
+  if (at_stmt_end())
+    return ast_node(AN_RETURN, 0);
+  return ast_node(AN_RETURN, 1, parse_expr());
+}
+
+/* print := "print" expr {"," expr} */
+static struct ast_node* parse_print(void) {
+  struct ast_node* n = ast_node(AN_PRINT, 0);
+  expect_kw(K_PRINT);
+  for (;;) {
+    ast_add(n, parse_expr());
+    if (!at_op(O_COMMA)) break;
+    read_token();
+  }
+  return n;
+}
+
+static struct ast_node* parse_statement(void) {
+  if (at_kw(K_VAR))    return parse_decl();
+  if (at_kw(K_IF))     return parse_if();
+  if (at_kw(K_WHILE))  return parse_while();
+  if (at_kw(K_FOR))    return parse_for();
+  if (at_kw(K_LOOP))   return parse_loop();
+  if (at_kw(K_EXIT))   { read_token(); return ast_node(AN_EXIT, 0); }
+  if (at_kw(K_RETURN)) return parse_return();
+  if (at_kw(K_PRINT))  return parse_print();
+  if (at_ident())      return parse_assign();
+
+  parse_error("statement");
+  return NULL;
+}
+
+/* body := { statement [";"] } */
+struct ast_node* parse_body(void) {
+  struct ast_node* n = ast_node(AN_BODY, 0);
+
+  for (;;) {
+    while (at_op(O_SEMICOL)) read_token();
+    if (at_kw(K_END) || at_kw(K_ELSE) || at_kw(K_ELSIF)) break;
+    if (peek()->type == 0) break;
+    ast_add(n, parse_statement());
+  }
+
+  return n;
+}
+
+/* ---- AST dump ----------------------------------------------------------- */
+
+static const char* const an_name[] = {
+  "BODY", "DECL", "ASSIGN", "IF", "IFSHORT", "WHILE", "FOR-NV-ND",
+  "FOR-V-D", "FOR-NV-D", "FOR-V-ND", "LOOP", "EXIT", "RETURN", "PRINT",
+  "VARDEF",
+  "IDENT", "ARRELEM", "TUPLENAME", "TUPLEINT", "ARRLEN", "TESTELEM",
+  "TUPLEEXPR", "FUNCCALL",
+  "EXPR", "COMP-LE", "COMP-LT", "COMP-EQ", "COMP-NE", "COMP-GE", "COMP-GT",
+  "FACTOR", "TERM", "ISEXPR", "UNARYPLUS", "UNARYMINUS", "NOT",
+  "FUNCLIT", "FUNCLITSHORT", "PARENTHESES",
+  "INT", "REAL", "BOOL", "STRING", "NONE", "FUNC", "ARRTYPE", "TPLTYPE",
+  "INTLIT", "REALLIT", "TRUE", "FALSE", "STRINGLIT", "ARRLIT", "TPLLIT",
+  "TPLELEM"
+};
+
+static void ast_dump(struct ast_node* n, int depth) {
+  int i;
+  if (n == NULL) return;
+  for (i = 0; i < depth; i++) fputs("  ", stdout);
+  fputs(an_name[n->type], stdout);
+  if (n->node_type != NULL) printf(" [%s]", n->node_type);
+  putchar('\n');
+  for (i = 0; i < n->child_cnt; i++)
+    ast_dump(n->children[i], depth + 1);
+}
+
+/* ---- token loading ------------------------------------------------------ */
+
+/* reads characters up to (not including) `term`, returns a heap string */
+static char* read_until(FILE* f, int term) {
+  int cap = 64, len = 0, c;
+  char* buf = malloc(cap);
+  if (buf == NULL) error("Out of memory");
+
+  while ((c = fgetc(f)) != EOF && c != term) {
+    if (len + 1 >= cap) {
+      cap *= 2;
+      buf = realloc(buf, cap);
+      if (buf == NULL) error("Out of memory");
+    }
+    buf[len++] = (char)c;
+  }
+  buf[len] = '\0';
+  return buf;
+}
+
+/* The tokenizer writes one token per line:
+     O<c> / K<c>   operator / keyword (c = enum value + 32)
+     E<text>       identifier
+     I<text>       integer      R<text>  real
+     S<text>'      string       D<text>" double-quoted string
+     N             line break */
+static void load_tokens(const char* path) {
+  FILE* f = fopen(path, "rb");
+  int cap = 256, c;
+
+  if (f == NULL) error("Cannot open file tokens");
+
+  tokens = malloc(sizeof(struct token) * cap);
+  if (tokens == NULL) error("Out of memory");
+  tok_cnt = 0;
+
+  while ((c = fgetc(f)) != EOF) {
+    struct token t;
+    memset(&t, 0, sizeof t);
+    t.type = (char)c;
+
+    if (c == 'O' || c == 'K') {
+      int v = fgetc(f);
+      if (v == EOF) break;
+      if (c == 'O') t.tv.op  = (enum operator)(v - 32);
+      else          t.tv.key = (enum keyword)(v - 32);
+      fgetc(f); /* newline */
+    } else if (c == 'N') {
+      fgetc(f); /* newline */
+    } else if (c == 'E' || c == 'I' || c == 'R') {
+      t.tv.other = read_until(f, '\n');
+    } else if (c == 'S' || c == 'D') {
+      t.tv.other = read_until(f, (c == 'S') ? '\'' : '"');
+      while ((c = fgetc(f)) != EOF && c != '\n') ; /* skip to end of line */
+    } else {
+      while ((c = fgetc(f)) != EOF && c != '\n') ; /* unknown: skip line */
+      continue;
+    }
+
+    if (tok_cnt == cap) {
+      cap *= 2;
+      tokens = realloc(tokens, sizeof(struct token) * cap);
+      if (tokens == NULL) error("Out of memory");
+    }
+    tokens[tok_cnt++] = t;
+  }
+
+  fclose(f);
+}
+
+int main(void) {
+  struct ast_node* root;
+
+  load_tokens("tokens");
+  cur_tok = 0;
+
+  root = parse_body();
+  if (peek()->type != 0) parse_error("end of file");
+
+  ast_dump(root, 0);
+  return 0;
 }
